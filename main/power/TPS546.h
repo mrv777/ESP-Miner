@@ -21,12 +21,25 @@
 #define OPERATION_OFF 0x00
 #define OPERATION_ON  0x80
 
-#define TPS546_INIT_PHASE 0x00  /* phase */
+#define TPS546_INIT_PHASE_SINGLE 0x00  /* Single-phase (Single TPS) */
+#define TPS546_INIT_PHASE_MULTI   0xFF  /* Multi-phase stack (Multi TPS) */
 
 #define TPS546_INIT_FREQUENCY 650  /* KHz */
 
+
+typedef struct {
+  uint16_t status_word;
+  uint8_t  st_vout, st_input, st_iout, st_temp, st_cml, st_mfr, st_other;
+  uint8_t  operation, on_off_config;
+  float    read_vout, read_vin, read_iout;
+  int      read_temp1;
+  float    vout_command;
+} TPS546_StatusSnapshot;
+
 typedef struct
 {
+  /* Phase readout configuration */
+  uint8_t TPS546_INIT_PHASE; /* phase register configuration */
   /* vin voltage */
   float TPS546_INIT_VIN_ON;  /* V */
   float TPS546_INIT_VIN_OFF; /* V */
@@ -40,6 +53,12 @@ typedef struct
   /* iout current */
   float TPS546_INIT_IOUT_OC_WARN_LIMIT; /* A */
   float TPS546_INIT_IOUT_OC_FAULT_LIMIT; /* A */
+
+  
+  uint16_t TPS546_INIT_STACK_CONFIG; /* Stack configuration */
+  uint8_t TPS546_INIT_SYNC_CONFIG; /* Sync configuration */
+  uint8_t TPS546_INIT_COMPENSATION_CONFIG[5];
+  
 } TPS546_CONFIG;
 
 /* vin voltage */
@@ -183,9 +202,11 @@ esp_err_t TPS546_set_vout(float volts);
 void TPS546_show_voltage_settings(void);
 void TPS546_print_status(void);
 
-esp_err_t TPS546_check_status(GlobalState * global_state);
+esp_err_t TPS546_check_status(GlobalState * GLOBAL_STATE);
 esp_err_t TPS546_clear_faults(void);
 
 const char* TPS546_get_error_message(void); //Get the current TPS error message
+void TPS546_log_snapshot(const TPS546_StatusSnapshot *s);
+esp_err_t TPS546_snapshot_status(TPS546_StatusSnapshot *s);
 
 #endif /* TPS546_H_ */

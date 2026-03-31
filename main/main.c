@@ -1,32 +1,30 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_psram.h"
-#include "nvs_flash.h"
-
-#include "main.h"
 
 #include "asic_result_task.h"
-#include "asic_task.h"
 #include "create_jobs_task.h"
+#include "hashrate_monitor_task.h"
+#include "fan_controller_task.h"
+#include "statistics_task.h"
 #include "system.h"
 #include "http_server.h"
-#include "nvs_config.h"
 #include "serial.h"
 #include "stratum_task.h"
 #include "i2c_bitaxe.h"
 #include "adc.h"
-#include "nvs_device.h"
+#include "nvs_config.h"
 #include "self_test.h"
 #include "asic.h"
-#include "driver/gpio.h"
+#include "bap/bap.h"
+#include "device_config.h"
+#include "connect.h"
+#include "asic_reset.h"
+#include "asic_init.h"
+#include "filesystem.h"
+#include "input.h"
 
-static GlobalState GLOBAL_STATE = {
-    .extranonce_str = NULL, 
-    .extranonce_2_len = 0, 
-    .abandon_work = 0, 
-    .version_mask = 0,
-    .ASIC_initalized = false
-};
+static GlobalState GLOBAL_STATE;
 
 static const char * TAG = "bitaxe";
 
@@ -45,87 +43,116 @@ void app_main(void)
     ESP_ERROR_CHECK(i2c_bitaxe_init());
     ESP_LOGI(TAG, "I2C initialized successfully");
 
-    //wait for I2C to init
+    // Initialize RST pin to low early to minimize ASIC power consumption
+    ESP_ERROR_CHECK(asic_hold_reset_low());
+    ESP_LOGI(TAG, "RST pin initialized to low");
+
+    // wait for I2C to init
     vTaskDelay(100 / portTICK_PERIOD_MS);
 
-    //Init ADC
+    // Init ADC
     ADC_init();
 
-    //initialize the ESP32 NVS
-    if (NVSDevice_init() != ESP_OK){
+    // initialize the ESP32 NVS
+    if (nvs_config_init() != ESP_OK) {
         ESP_LOGE(TAG, "Failed to init NVS");
         return;
     }
 
-    //parse the NVS config into GLOBAL_STATE
-    if (NVSDevice_parse_config(&GLOBAL_STATE) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to parse NVS config");
+    // Ensure SSID is initialized before any screen/self-test uses it.
+    GLOBAL_STATE.SYSTEM_MODULE.ssid = nvs_config_get_string(NVS_CONFIG_WIFI_SSID);
+    if (GLOBAL_STATE.SYSTEM_MODULE.ssid == NULL) {
+        ESP_LOGW(TAG, "No SSID configured in NVS, using empty string");
+        GLOBAL_STATE.SYSTEM_MODULE.ssid = strdup("");
+        if (GLOBAL_STATE.SYSTEM_MODULE.ssid == NULL) {
+            ESP_LOGE(TAG, "Failed to allocate memory for SSID");
+            return;
+        }
+    }
+
+    if (device_config_init(&GLOBAL_STATE) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to init device config");
         return;
     }
 
-    if (ASIC_set_device_model(&GLOBAL_STATE) != ESP_OK) {
-        ESP_LOGE(TAG, "Error setting ASIC model");
-        return;
-    }
-
-    // Optionally hold the boot button
-    bool pressed = gpio_get_level(CONFIG_GPIO_BUTTON_BOOT) == 0; // LOW when pressed
-    //should we run the self test?
-    if (should_test(&GLOBAL_STATE) || pressed) {
-        self_test((void *) &GLOBAL_STATE);
+    if (self_test_init(&GLOBAL_STATE) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to init self test");
         return;
     }
 
     SYSTEM_init_system(&GLOBAL_STATE);
 
-    char * wifi_ssid;
-    char * wifi_pass;
-    char * hostname;
+    if (!GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
+        wifi_init(&GLOBAL_STATE);
+    }
 
-    NVSDevice_get_wifi_creds(&GLOBAL_STATE, &wifi_ssid, &wifi_pass, &hostname);
+    esp_err_t system_init_ret = SYSTEM_init_peripherals(&GLOBAL_STATE);
+    
+    if (system_init_ret == ESP_OK) {
+        if (xTaskCreate(POWER_MANAGEMENT_task, "power management", 8192, (void *) &GLOBAL_STATE, 10, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "Error creating power management task");
+        }
+        if (!GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
+            if (xTaskCreate(FAN_CONTROLLER_task, "fan_controller", 8192, (void *) &GLOBAL_STATE, 5, NULL) != pdPASS) {
+                ESP_LOGE(TAG, "Error creating fan controller task");
+            }
+        }
+    } else {
+        ESP_LOGE(TAG, "Critical peripheral initialization failure (%s). Entering degraded mode.", esp_err_to_name(GLOBAL_STATE.SELF_TEST_MODULE.system_init_ret));
+    }
+    
+    if (!GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
+        // start the API for AxeOS
+        start_rest_server((void *) &GLOBAL_STATE);
+    }
 
-    // init AP and connect to wifi
-    wifi_init(&GLOBAL_STATE, wifi_ssid, wifi_pass, hostname);
+    // After mounting SPIFFS
+    SYSTEM_init_versions(&GLOBAL_STATE);
 
-    SYSTEM_init_peripherals(&GLOBAL_STATE);
-
-    xTaskCreate(POWER_MANAGEMENT_task, "power management", 8192, (void *) &GLOBAL_STATE, 10, NULL);
-
-    //start the API for AxeOS
-    start_rest_server((void *) &GLOBAL_STATE);
+    // Initialize BAP interface
+    esp_err_t bap_ret = BAP_init(&GLOBAL_STATE);
+    if (bap_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize BAP interface: %d", bap_ret);
+        // Continue anyway, as BAP is not critical for core functionality
+    }
 
     while (!GLOBAL_STATE.SYSTEM_MODULE.is_connected) {
         vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 
-    ESP_LOGI(TAG, "Connected to SSID: %s", wifi_ssid);
-
-    free(wifi_ssid);
-    free(wifi_pass);
-    free(hostname);
-
-    GLOBAL_STATE.new_stratum_version_rolling_msg = false;
-
-    wifi_softap_off();
-
     queue_init(&GLOBAL_STATE.stratum_queue);
-    queue_init(&GLOBAL_STATE.ASIC_jobs_queue);
 
-    SERIAL_init();
+    if (system_init_ret == ESP_OK) {
+        if (asic_initialize(&GLOBAL_STATE, ASIC_INIT_COLD_BOOT, 0) == 0) {
+            return;
+        }
 
-    if (ASIC_init(&GLOBAL_STATE) == 0) {
-        GLOBAL_STATE.SYSTEM_MODULE.asic_status = "Chip count 0";
-        ESP_LOGE(TAG, "Chip count 0");
-        return;
+        if (xTaskCreate(create_jobs_task, "stratum miner", 8192, (void *) &GLOBAL_STATE, 20, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "Error creating stratum miner task");
+        }
+        if (xTaskCreate(ASIC_result_task, "asic result", 8192, (void *) &GLOBAL_STATE, 15, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "Error creating asic result task");
+        }
+
+        if (!GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
+            if (xTaskCreate(stratum_task, "stratum admin", 8192, (void *) &GLOBAL_STATE, 5, NULL) != pdPASS) {
+                ESP_LOGE(TAG, "Error creating stratum admin task");
+            }
+        }
+
+        if (xTaskCreateWithCaps(hashrate_monitor_task, "hashrate monitor", 8192, (void *) &GLOBAL_STATE, 5, NULL, MALLOC_CAP_SPIRAM) !=
+            pdPASS) {
+            ESP_LOGE(TAG, "Error creating hashrate monitor task");
+        }
+        if (xTaskCreateWithCaps(statistics_task, "statistics", 8192, (void *) &GLOBAL_STATE, 3, NULL, MALLOC_CAP_SPIRAM) != pdPASS) {
+            ESP_LOGE(TAG, "Error creating statistics task");
+        }
     }
 
-    SERIAL_set_baud(ASIC_set_max_baud(&GLOBAL_STATE));
-    SERIAL_clear_buffer();
-
-    GLOBAL_STATE.ASIC_initalized = true;
-
-    xTaskCreate(stratum_task, "stratum admin", 8192, (void *) &GLOBAL_STATE, 5, NULL);
-    xTaskCreate(create_jobs_task, "stratum miner", 8192, (void *) &GLOBAL_STATE, 10, NULL);
-    xTaskCreate(ASIC_task, "asic", 8192, (void *) &GLOBAL_STATE, 10, NULL);
-    xTaskCreate(ASIC_result_task, "asic result", 8192, (void *) &GLOBAL_STATE, 15, NULL);
+    if (GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
+        GLOBAL_STATE.SELF_TEST_MODULE.system_init_ret = system_init_ret;
+        if (xTaskCreate(self_test_task, "self_test", 8192, (void *) &GLOBAL_STATE, 10, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "Error creating self test task");
+        }
+    }
 }

@@ -26,11 +26,10 @@
 
 static const char *TAG = "TPS546";
 
-static uint8_t DEVICE_ID1[] = {0x54, 0x49, 0x54, 0x6B, 0x24, 0x41}; // TPS546D24A
-static uint8_t DEVICE_ID2[] = {0x54, 0x49, 0x54, 0x6D, 0x24, 0x41}; // TPS546D24A
-static uint8_t DEVICE_ID3[] = {0x54, 0x49, 0x54, 0x6D, 0x24, 0x62}; // TPS546D24S
-
-//static uint8_t COMPENSATION_CONFIG[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static uint8_t DEVICE_ID_TPS546D24A[] = {0x54, 0x49, 0x54, 0x6D, 0x24, 0x41};
+static uint8_t DEVICE_ID_TPS546D24S[] = {0x54, 0x49, 0x54, 0x6D, 0x24, 0x62};
+// static uint8_t DEVICE_ID_TPS546B24A[] = {0x54, 0x49, 0x54, 0x6B, 0x24, 0x41};
+// static uint8_t DEVICE_ID_TPS546B24S[] = {0x54, 0x49, 0x54, 0x6B, 0x24, 0x62};
 
 static i2c_master_dev_handle_t tps546_i2c_handle;
 
@@ -114,30 +113,30 @@ static esp_err_t smb_read_block(uint8_t command, uint8_t *data, uint8_t len)
     return ESP_OK;
 }
 
-// /**
-//  * @brief SMBus write block - don;t forget the length byte first :P
-//  * @param command The command to write
-//  * @param data The data to write
-//  * @param len The number of bytes to write
-//  */
-// static esp_err_t smb_write_block(uint8_t command, uint8_t *data, uint8_t len)
-// {
-//     //malloc a buffer len+2 to store the command byte and then the length byte
-//     uint8_t *buf = (uint8_t *)malloc(len+2);
-//     buf[0] = command;
-//     buf[1] = len;
-//     //copy the data into the buffer
-//     memcpy(buf+2, data, len);
+/**
+ * @brief SMBus write block - don;t forget the length byte first :P
+ * @param command The command to write
+ * @param data The data to write
+ * @param len The number of bytes to write
+ */
+static esp_err_t smb_write_block(uint8_t command, uint8_t *data, uint8_t len)
+{
+    //malloc a buffer len+2 to store the command byte and then the length byte
+    uint8_t *buf = (uint8_t *)malloc(len+2);
+    buf[0] = command;
+    buf[1] = len;
+    //copy the data into the buffer
+    memcpy(buf+2, data, len);
 
-//     //write it all
-//     if (i2c_bitaxe_register_write_bytes(tps546_i2c_handle, buf, len+2) != ESP_OK) {
-//         free(buf);
-//         return ESP_FAIL;
-//     } else {
-//         free(buf);
-//         return ESP_OK;
-//     }
-// }
+    //write it all
+    if (i2c_bitaxe_register_write_bytes(tps546_i2c_handle, buf, len+2) != ESP_OK) {
+        free(buf);
+        return ESP_FAIL;
+    } else {
+        free(buf);
+        return ESP_OK;
+    }
+}
 
 /**
  * @brief Convert an SLINEAR11 value into an int
@@ -332,9 +331,8 @@ static uint16_t float_2_ulinear16(float value)
 */
 esp_err_t TPS546_init(TPS546_CONFIG config)
 {
-	uint8_t data[7];
-    uint8_t u8_value;
-    uint16_t u16_value;
+    uint8_t u8_value = 0;
+    uint16_t u16_value = 0;
     uint8_t read_mfr_revision[4];
     int temp;
     uint8_t comp_config[5];
@@ -343,15 +341,34 @@ esp_err_t TPS546_init(TPS546_CONFIG config)
     tps546_config = config;
 
     ESP_LOGI(TAG, "Initializing the core voltage regulator");
-
     ESP_RETURN_ON_ERROR(i2c_bitaxe_add_device(TPS546_I2CADDR, &tps546_i2c_handle, TAG), TAG, "Failed to add TPS546 I2C");
 
-    /* Establish communication with regulator */
-    smb_read_block(PMBUS_IC_DEVICE_ID, data, 6); //the DEVICE_ID block first byte is the length.
-    ESP_LOGI(TAG, "Device ID: %02x %02x %02x %02x %02x %02x", data[0], data[1], data[2], data[3], data[4], data[5]);
-    /* There's 3 different known device IDs observed so far */
-    if ( (memcmp(data, DEVICE_ID1, 6) != 0) && (memcmp(data, DEVICE_ID2, 6) != 0) && (memcmp(data, DEVICE_ID3, 6) != 0))
-    {
+    // 1) Power-up guard (PMBus ready after AVIN UVLO + ~8 ms)
+    vTaskDelay(pdMS_TO_TICKS(15));  // conservative
+
+    // 2) Robust ID read with retries
+    uint8_t id[6] = {0};
+    const int max_attempts = 6;
+    bool id_matched = false;
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        esp_err_t err = smb_read_block(PMBUS_IC_DEVICE_ID, id, 6);  // ensure this API consumes the length byte internally
+        if (err == ESP_OK) {
+            if (memcmp(id, DEVICE_ID_TPS546D24A, 6) == 0
+             || memcmp(id, DEVICE_ID_TPS546D24S, 6) == 0
+            //  || memcmp(id, DEVICE_ID_TPS546B24A, 6) == 0
+            //  || memcmp(id, DEVICE_ID_TPS546B24S, 6) == 0
+                ) {
+                id_matched = true;  // got a real response
+                break;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(3));  // short backoff; total extra ~15 ms worst case
+    }
+
+    ESP_LOGI(TAG, "Device ID: %02x %02x %02x %02x %02x %02x", id[0], id[1], id[2], id[3], id[4], id[5]);
+
+    if (!id_matched) {
+
         ESP_LOGE(TAG, "Cannot find TPS546 regulator - Device ID mismatch");
         return ESP_FAIL;
     }
@@ -502,21 +519,46 @@ void TPS546_read_mfr_info(uint8_t *read_mfr_revision)
 */
 void TPS546_write_entire_config(void)
 {
+    
     ESP_LOGI(TAG, "---Writing new config values to TPS546---");
-    /* set up the ON_OFF_CONFIG */
-    // ESP_LOGI(TAG, "Setting ON_OFF_CONFIG: %02X", TPS546_INIT_ON_OFF_CONFIG);
-    // if (smb_write_byte(PMBUS_ON_OFF_CONFIG, TPS546_INIT_ON_OFF_CONFIG) != ESP_OK) {
-    //     ESP_LOGE(TAG, "Failed to write ON_OFF_CONFIG");
-    //     return;
-    // }
+
+        // ON_OFF_CONFIG
+    //u8_value = (ON_OFF_CONFIG_DELAY | ON_OFF_CONFIG_POLARITY | ON_OFF_CONFIG_CP | ON_OFF_CONFIG_CMD | ON_OFF_CONFIG_PU);
+    uint8_t u8_value = (ON_OFF_CONFIG_DELAY | ON_OFF_CONFIG_POLARITY | ON_OFF_CONFIG_CMD | ON_OFF_CONFIG_PU);
+    ESP_LOGI(TAG, "Setting ON_OFF_CONFIG: %02X", u8_value);
+    smb_write_byte(PMBUS_ON_OFF_CONFIG, u8_value);
+
+
+    // STACK_CONFIG
+    ESP_LOGI(TAG, "Setting STACK_CONFIG: %04X", tps546_config.TPS546_INIT_STACK_CONFIG);
+    smb_write_word(PMBUS_STACK_CONFIG, tps546_config.TPS546_INIT_STACK_CONFIG);
+
+    // SYNC_CONFIG
+    ESP_LOGI(TAG, "Setting SYNC_CONFIG: %02X", tps546_config.TPS546_INIT_SYNC_CONFIG);
+    smb_write_byte(PMBUS_SYNC_CONFIG, tps546_config.TPS546_INIT_SYNC_CONFIG);
+
 
     /* Phase */
-    ESP_LOGI(TAG, "Setting PHASE: %02X", TPS546_INIT_PHASE);
-    smb_write_byte(PMBUS_PHASE, TPS546_INIT_PHASE);
+    ESP_LOGI(TAG, "Setting PHASE: %02X", tps546_config.TPS546_INIT_PHASE);
+    smb_write_byte(PMBUS_PHASE, tps546_config.TPS546_INIT_PHASE);
 
     /* Switch frequency */
     ESP_LOGI(TAG, "Setting FREQUENCY: %dMHz", TPS546_INIT_FREQUENCY);
     smb_write_word(PMBUS_FREQUENCY_SWITCH, int_2_slinear11(TPS546_INIT_FREQUENCY));
+
+    if(tps546_config.TPS546_INIT_COMPENSATION_CONFIG[0] != 0 &&
+       tps546_config.TPS546_INIT_COMPENSATION_CONFIG[1] != 0 &&
+       tps546_config.TPS546_INIT_COMPENSATION_CONFIG[2] != 0 &&
+       tps546_config.TPS546_INIT_COMPENSATION_CONFIG[3] != 0 &&
+       tps546_config.TPS546_INIT_COMPENSATION_CONFIG[4] != 0 ) {
+        // COMPENSATION_CONFIG
+        ESP_LOGI(TAG, "Setting COMPENSATION_CONFIG: %02X %02X %02X %02X %02X",
+            tps546_config.TPS546_INIT_COMPENSATION_CONFIG[0], tps546_config.TPS546_INIT_COMPENSATION_CONFIG[1],
+            tps546_config.TPS546_INIT_COMPENSATION_CONFIG[2], tps546_config.TPS546_INIT_COMPENSATION_CONFIG[3],
+            tps546_config.TPS546_INIT_COMPENSATION_CONFIG[4]);
+        smb_write_block(PMBUS_COMPENSATION_CONFIG, tps546_config.TPS546_INIT_COMPENSATION_CONFIG, 5);
+
+    }
 
     /* vin voltage */
 
@@ -633,7 +675,7 @@ void TPS546_write_entire_config(void)
 
 int TPS546_get_frequency(void)
 {
-    uint16_t value;
+    uint16_t value = 0;
     int freq;
 
     smb_read_word(PMBUS_FREQUENCY_SWITCH, &value);
@@ -644,7 +686,7 @@ int TPS546_get_frequency(void)
 
 void TPS546_set_frequency(int newfreq)
 {
-    uint16_t value;
+    uint16_t value = 0;
     //int freq;
 
     ESP_LOGI(TAG, "Writing new frequency: %d", newfreq);
@@ -659,7 +701,7 @@ void TPS546_set_frequency(int newfreq)
 
 int TPS546_get_temperature(void)
 {
-    uint16_t value;
+    uint16_t value = 0;
     int temp;
 
     smb_read_word(PMBUS_READ_TEMPERATURE_1, &value);
@@ -669,7 +711,7 @@ int TPS546_get_temperature(void)
 
 float TPS546_get_vin(void)
 {
-    uint16_t u16_value;
+    uint16_t u16_value = 0;
     float vin;
 
     /* Get voltage input (ULINEAR16) */
@@ -687,11 +729,8 @@ float TPS546_get_vin(void)
 
 float TPS546_get_iout(void)
 {
-    uint16_t u16_value;
+    uint16_t u16_value = 0;
     float iout;
-
-    //set the phase register to 0xFF to read all phases
-    smb_write_byte(PMBUS_PHASE, 0xFF);
 
     /* Get current output (SLINEAR11) */
     if (smb_read_word(PMBUS_READ_IOUT, &u16_value) != ESP_OK) {
@@ -704,16 +743,13 @@ float TPS546_get_iout(void)
         ESP_LOGI(TAG, "Got Iout: %2.3f A", iout);
     #endif
 
-    //set the phase register back to the default
-    smb_write_byte(PMBUS_PHASE, TPS546_INIT_PHASE);
-
         return iout;
     }
 }
 
 float TPS546_get_vout(void)
 {
-    uint16_t u16_value;
+    uint16_t u16_value = 0;
     float vout;
 
     /* Get voltage output (ULINEAR16) */
@@ -729,20 +765,20 @@ float TPS546_get_vout(void)
     }
 }
 
-esp_err_t TPS546_check_status(GlobalState * global_state) {
+esp_err_t TPS546_check_status(GlobalState * GLOBAL_STATE) {
 
+    SystemModule * SYSTEM_MODULE = &GLOBAL_STATE->SYSTEM_MODULE;
     uint16_t status;
-    SystemModule * sys_module = &global_state->SYSTEM_MODULE;
 
     ESP_RETURN_ON_ERROR(smb_read_word(PMBUS_STATUS_WORD, &status), TAG, "Failed to read STATUS_WORD");
     //determine if this is a fault we care about
     if (status & (TPS546_STATUS_OFF | TPS546_STATUS_VOUT_OV | TPS546_STATUS_IOUT_OC | TPS546_STATUS_VIN_UV | TPS546_STATUS_TEMP)) {
-        if (sys_module->power_fault == 0) {
+        if (SYSTEM_MODULE->power_fault == 0) {
             ESP_RETURN_ON_ERROR(TPS546_parse_status(status), TAG, "Failed to parse STATUS_WORD");
-            sys_module->power_fault = 1;
+            SYSTEM_MODULE->power_fault = 1;
         }
     } else {
-        sys_module->power_fault = 0;
+        SYSTEM_MODULE->power_fault = 0;
     }
     return ESP_OK;
 }
@@ -1009,7 +1045,7 @@ esp_err_t TPS546_set_vout(float volts) {
 
 void TPS546_show_voltage_settings(void)
 {
-    uint16_t u16_value;
+    uint16_t u16_value = 0;
     uint8_t u8_value;
     float f_value;
 
@@ -1082,5 +1118,160 @@ void TPS546_show_voltage_settings(void)
     smb_read_word(PMBUS_VOUT_MIN, &u16_value);
     f_value = ulinear16_2_float(u16_value);
     ESP_LOGI(TAG, "read VOUT_MIN: %.2f V", f_value);
+}
+
+esp_err_t TPS546_snapshot_status(TPS546_StatusSnapshot *s) {
+    uint16_t u16 = 0;
+    uint8_t  u8  = 0;
+    esp_err_t err;
+
+    // 1) Top-level
+    err = smb_read_word(PMBUS_STATUS_WORD, &s->status_word);
+    if (err != ESP_OK) { return err; }
+
+    // 2) Details (read unconditionally so we always have a complete picture)
+    err = smb_read_byte(PMBUS_STATUS_VOUT, &u8);
+    if (err != ESP_OK) { return err; }
+    s->st_vout = u8;
+
+    err = smb_read_byte(PMBUS_STATUS_INPUT, &u8);
+    if (err != ESP_OK) { return err; }
+    s->st_input = u8;
+
+    err = smb_read_byte(PMBUS_STATUS_IOUT, &u8);
+    if (err != ESP_OK) { return err; }
+    s->st_iout = u8;
+
+    err = smb_read_byte(PMBUS_STATUS_TEMPERATURE, &u8);
+    if (err != ESP_OK) { return err; }
+    s->st_temp = u8;
+
+    err = smb_read_byte(PMBUS_STATUS_CML, &u8);
+    if (err != ESP_OK) { return err; }
+    s->st_cml = u8;
+
+    err = smb_read_byte(PMBUS_STATUS_MFR_SPECIFIC, &u8);  // POR / RESET_VOUT bits
+    if (err != ESP_OK) { return err; }
+    s->st_mfr = u8;
+
+    err = smb_read_byte(PMBUS_STATUS_OTHER, &u8);
+    if (err != ESP_OK) { return err; }
+    s->st_other = u8;
+
+    // 3) Context
+    err = smb_read_byte(PMBUS_OPERATION, &u8);
+    if (err != ESP_OK) { return err; }
+    s->operation = u8;
+
+    err = smb_read_byte(PMBUS_ON_OFF_CONFIG, &u8);
+    if (err != ESP_OK) { return err; }
+    s->on_off_config = u8;
+
+    err = smb_read_word(PMBUS_VOUT_COMMAND, &u16);
+    if (err != ESP_OK) { return err; }
+    s->vout_command = ulinear16_2_float(u16);
+
+    err = smb_read_word(PMBUS_READ_VOUT, &u16);
+    if (err != ESP_OK) { return err; }
+    s->read_vout = ulinear16_2_float(u16);
+
+    err = smb_read_word(PMBUS_READ_VIN, &u16);
+    if (err != ESP_OK) { return err; }
+    s->read_vin = slinear11_2_float(u16);
+
+    err = smb_read_word(PMBUS_READ_IOUT, &u16);
+    if (err != ESP_OK) { return err; }
+    s->read_iout = slinear11_2_float(u16);
+
+    err = smb_read_word(PMBUS_READ_TEMPERATURE_1, &u16);
+    if (err != ESP_OK) { return err; }
+    s->read_temp1 = slinear11_2_int(u16);
+
+    return ESP_OK;
+}
+
+ void TPS546_log_snapshot(const TPS546_StatusSnapshot *s) {
+    ESP_LOGE(TAG, "================ TPS546 SNAPSHOT ================");
+    ESP_LOGE(TAG, "STATUS_WORD: 0x%04X", s->status_word);
+
+    // Top-level flags (only print if set)
+    if (s->status_word & TPS546_STATUS_BUSY)    ESP_LOGE(TAG, "  BUSY");
+    if (s->status_word & TPS546_STATUS_OFF)     ESP_LOGE(TAG, "  OFF");
+    if (s->status_word & TPS546_STATUS_VOUT_OV) ESP_LOGE(TAG, "  VOUT_OV");
+    if (s->status_word & TPS546_STATUS_IOUT_OC) ESP_LOGE(TAG, "  IOUT_OC");
+    if (s->status_word & TPS546_STATUS_VIN_UV)  ESP_LOGE(TAG, "  VIN_UV");
+    if (s->status_word & TPS546_STATUS_TEMP)    ESP_LOGE(TAG, "  TEMP");
+    if (s->status_word & TPS546_STATUS_CML)     ESP_LOGE(TAG, "  CML");
+    if (s->status_word & TPS546_STATUS_PGOOD)   ESP_LOGE(TAG, "  PGOOD=NOT IN REGULATION");
+    if (s->status_word & TPS546_STATUS_OTHER)   ESP_LOGE(TAG, "  OTHER");
+    if (s->status_word & TPS546_STATUS_VOUT)    ESP_LOGE(TAG, "  VOUT (detail)");
+    if (s->status_word & TPS546_STATUS_IOUT)    ESP_LOGE(TAG, "  IOUT (detail)");
+    if (s->status_word & TPS546_STATUS_INPUT)   ESP_LOGE(TAG, "  INPUT (detail)");
+    if (s->status_word & TPS546_STATUS_MFR)     ESP_LOGE(TAG, "  MFR_SPECIFIC (detail)");
+
+    // Context (always useful)
+    ESP_LOGE(TAG, "OPERATION: 0x%02X  (ON bit: %d)", s->operation, !!(s->operation & 0x80));
+    ESP_LOGE(TAG, "ON_OFF_CONFIG: 0x%02X", s->on_off_config);
+    ESP_LOGE(TAG, "VOUT_COMMAND: %.3f V", s->vout_command);
+    ESP_LOGE(TAG, "READ_VOUT:    %.3f V", s->read_vout);
+    ESP_LOGE(TAG, "READ_VIN:     %.3f V", s->read_vin);
+    ESP_LOGE(TAG, "READ_IOUT:    %.3f A", s->read_iout);
+    ESP_LOGE(TAG, "TEMP1:        %d C",   s->read_temp1);
+
+    // Detail bytes — print only set bits
+    if (s->status_word & TPS546_STATUS_VOUT) {
+        ESP_LOGE(TAG, "STATUS_VOUT: 0x%02X", s->st_vout);
+        if (s->st_vout & TPS546_STATUS_VOUT_OVF)     ESP_LOGE(TAG, "  VOUT_OV_FAULT");
+        if (s->st_vout & TPS546_STATUS_VOUT_OVW)     ESP_LOGE(TAG, "  VOUT_OV_WARN");
+        if (s->st_vout & TPS546_STATUS_VOUT_UVW)     ESP_LOGE(TAG, "  VOUT_UV_WARN");
+        if (s->st_vout & TPS546_STATUS_VOUT_UVF)     ESP_LOGE(TAG, "  VOUT_UV_FAULT");
+        if (s->st_vout & TPS546_STATUS_VOUT_MIN_MAX) ESP_LOGE(TAG, "  VOUT_MIN_MAX");
+        if (s->st_vout & TPS546_STATUS_VOUT_TON_MAX) ESP_LOGE(TAG, "  TON_MAX_EXPIRED");
+    }
+
+    if (s->status_word & TPS546_STATUS_INPUT) {
+        ESP_LOGE(TAG, "STATUS_INPUT: 0x%02X", s->st_input);
+        if (s->st_input & TPS546_STATUS_VIN_OVF)     ESP_LOGE(TAG, "  VIN_OV_FAULT");
+        if (s->st_input & TPS546_STATUS_VIN_UVW)     ESP_LOGE(TAG, "  VIN_UV_WARN");
+        if (s->st_input & TPS546_STATUS_VIN_LOW_VIN) ESP_LOGE(TAG, "  LOW_VIN (live)");
+    }
+
+    if (s->status_word & TPS546_STATUS_IOUT) {
+        ESP_LOGE(TAG, "STATUS_IOUT: 0x%02X", s->st_iout);
+        if (s->st_iout & TPS546_STATUS_IOUT_OCF)     ESP_LOGE(TAG, "  IOUT_OC_FAULT");
+        if (s->st_iout & TPS546_STATUS_IOUT_OCW)     ESP_LOGE(TAG, "  IOUT_OC_WARN");
+    }
+
+    if (s->status_word & TPS546_STATUS_TEMP) {
+        ESP_LOGE(TAG, "STATUS_TEMPERATURE: 0x%02X", s->st_temp);
+        if (s->st_temp & TPS546_STATUS_TEMP_OTF)     ESP_LOGE(TAG, "  OT_FAULT");
+        if (s->st_temp & TPS546_STATUS_TEMP_OTW)     ESP_LOGE(TAG, "  OT_WARN");
+    }
+
+    if (s->status_word & TPS546_STATUS_CML) {
+        ESP_LOGE(TAG, "STATUS_CML: 0x%02X", s->st_cml);
+        if (s->st_cml & TPS546_STATUS_CML_IVC)  ESP_LOGE(TAG, "  INVALID_COMMAND");
+        if (s->st_cml & TPS546_STATUS_CML_IVD)  ESP_LOGE(TAG, "  INVALID_DATA");
+        if (s->st_cml & TPS546_STATUS_CML_PEC)  ESP_LOGE(TAG, "  PEC_ERROR");
+        if (s->st_cml & TPS546_STATUS_CML_MEM)  ESP_LOGE(TAG, "  MEMORY_ERROR");
+        if (s->st_cml & TPS546_STATUS_CML_PROC) ESP_LOGE(TAG, "  LOGIC_CORE_ERROR");
+        if (s->st_cml & TPS546_STATUS_CML_COMM) ESP_LOGE(TAG, "  COMM_ERROR");
+    }
+
+    if (s->status_word & TPS546_STATUS_MFR) {
+        ESP_LOGE(TAG, "STATUS_MFR_SPECIFIC: 0x%02X", s->st_mfr);
+        if (s->st_mfr & TPS546_STATUS_MFR_POR)   ESP_LOGE(TAG, "  POR_OCCURRED");
+        if (s->st_mfr & TPS546_STATUS_MFR_SELF)  ESP_LOGE(TAG, "  SELF_CHECK_IN_PROGRESS");
+        if (s->st_mfr & TPS546_STATUS_MFR_RESET) ESP_LOGE(TAG, "  RESET_VOUT_OCCURRED");
+        if (s->st_mfr & TPS546_STATUS_MFR_BCX)   ESP_LOGE(TAG, "  BCX_FAULT");
+        if (s->st_mfr & TPS546_STATUS_MFR_SYNC)  ESP_LOGE(TAG, "  SYNC_FAULT");
+    }
+
+    if (s->status_word & TPS546_STATUS_OTHER) {
+        ESP_LOGE(TAG, "STATUS_OTHER: 0x%02X", s->st_other);
+        if (s->st_other & TPS546_STATUS_OTHER_FIRST) ESP_LOGE(TAG, "  FIRST_TO_ASSERT_SMBALERT");
+    }
+
+    ESP_LOGE(TAG, "=================================================");
 }
 

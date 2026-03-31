@@ -6,9 +6,10 @@ SRCS
     "bm1397.c"
     "serial.c"
     "crc.c"
-    "common.c"
+    "asic_common.c"
     "asic.c"
     "frequency_transition_bmXX.c"
+    "pll.c"
 
 INCLUDE_DIRS 
     "include"
@@ -17,6 +18,7 @@ REQUIRES
     "freertos"
     "driver"
     "stratum"
+    "tcp_transport"
 )
 
 

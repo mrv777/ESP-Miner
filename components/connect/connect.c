@@ -1,19 +1,16 @@
 #include <string.h>
 #include "esp_event.h"
 #include "esp_log.h"
-#include "esp_system.h"
 #include "esp_wifi.h"
-#include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "lwip/err.h"
-#include "lwip/lwip_napt.h"
-#include "lwip/sys.h"
-#include "nvs_flash.h"
 #include "esp_wifi_types_generic.h"
 
 #include "connect.h"
 #include "global_state.h"
+#include "nvs_config.h"
 
 // Maximum number of access points to scan
 #define MAX_AP_COUNT 20
@@ -51,6 +48,8 @@
 
 static const char * TAG = "connect";
 
+static TimerHandle_t ip_acquire_timer = NULL;
+
 static bool is_scanning = false;
 static uint16_t ap_number = 0;
 static wifi_ap_record_t ap_info[MAX_AP_COUNT];
@@ -58,6 +57,8 @@ static int s_retry_num = 0;
 static int clients_connected_to_ap = 0;
 
 static const char *get_wifi_reason_string(int reason);
+static void wifi_softap_on(void);
+static void wifi_softap_off(void);
 
 esp_err_t get_wifi_current_rssi(int8_t *rssi)
 {
@@ -132,6 +133,16 @@ esp_err_t wifi_scan(wifi_ap_record_simple_t *ap_records, uint16_t *ap_count)
     return ESP_OK;
 }
 
+static void ip_timeout_callback(TimerHandle_t xTimer)
+{
+    GlobalState *GLOBAL_STATE = (GlobalState *)pvTimerGetTimerID(xTimer);
+    if (!GLOBAL_STATE->SYSTEM_MODULE.is_connected) {
+        ESP_LOGI(TAG, "Timeout waiting for IP address. Disconnecting...");
+        strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "IP Acquire Timeout");
+        esp_wifi_disconnect();
+    }
+}
+
 static void event_handler(void * arg, esp_event_base_t event_base, int32_t event_id, void * event_data)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)arg;
@@ -158,8 +169,15 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
         }
 
         if (event_id == WIFI_EVENT_STA_CONNECTED) {
-            ESP_LOGI(TAG, "Connected!");
-            strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Connected!");
+            ESP_LOGI(TAG, "Acquiring IP...");
+            strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Acquiring IP...");
+
+            if (ip_acquire_timer == NULL) {
+                ip_acquire_timer = xTimerCreate("ip_acquire_timer", pdMS_TO_TICKS(30000), pdFALSE, (void *)GLOBAL_STATE, ip_timeout_callback);
+            }
+            if (ip_acquire_timer != NULL) {
+                xTimerStart(ip_acquire_timer, 0);
+            }            
         }
 
         if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -169,15 +187,17 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
                 return;
             }
 
-            ESP_LOGI(TAG, "Could not connect to '%s' [rssi %d]: reason %d", event->ssid, event->rssi, event->reason);
-
+            ESP_LOGI(TAG, "Could not connect to '%.*s' [rssi %d]: reason %d", event->ssid_len, event->ssid, event->rssi, event->reason);
             if (clients_connected_to_ap > 0) {
                 ESP_LOGI(TAG, "Client(s) connected to AP, not retrying...");
-                sprintf(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Config AP connected!");
+                snprintf(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, sizeof(GLOBAL_STATE->SYSTEM_MODULE.wifi_status), "Config AP connected!");
                 return;
             }
 
-            sprintf(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "%s (Error %d, retry #%d)", get_wifi_reason_string(event->reason), event->reason, s_retry_num);
+            GLOBAL_STATE->SYSTEM_MODULE.is_connected = false;
+            wifi_softap_on();
+
+            snprintf(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, sizeof(GLOBAL_STATE->SYSTEM_MODULE.wifi_status), "%s (Error %d, retry #%d)", get_wifi_reason_string(event->reason), event->reason, s_retry_num);
             ESP_LOGI(TAG, "Wi-Fi status: %s", GLOBAL_STATE->SYSTEM_MODULE.wifi_status);
 
             // Wait a little
@@ -186,6 +206,10 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
             s_retry_num++;
             ESP_LOGI(TAG, "Retrying Wi-Fi connection...");
             esp_wifi_connect();
+
+            if (ip_acquire_timer != NULL) {
+                xTimerStop(ip_acquire_timer, 0);
+            }            
         }
         
         if (event_id == WIFI_EVENT_AP_START) {
@@ -211,26 +235,72 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
         ip_event_got_ip_t * event = (ip_event_got_ip_t *) event_data;
         snprintf(GLOBAL_STATE->SYSTEM_MODULE.ip_addr_str, IP4ADDR_STRLEN_MAX, IPSTR, IP2STR(&event->ip_info.ip));
 
-        ESP_LOGI(TAG, "IP Address: %s", GLOBAL_STATE->SYSTEM_MODULE.ip_addr_str);
+        ESP_LOGI(TAG, "IPv4 Address: %s", GLOBAL_STATE->SYSTEM_MODULE.ip_addr_str);
         s_retry_num = 0;
 
+        xTimerStop(ip_acquire_timer, 0);
+            if (ip_acquire_timer != NULL) {
+        }
+
         GLOBAL_STATE->SYSTEM_MODULE.is_connected = true;
+
+        ESP_LOGI(TAG, "Connected to SSID: %s", GLOBAL_STATE->SYSTEM_MODULE.ssid);
+        strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Connected!");
+
+        wifi_softap_off();
+        
+        // Create IPv6 link-local address after WiFi connection
+        esp_netif_t *netif = event->esp_netif;
+        esp_err_t ipv6_err = esp_netif_create_ip6_linklocal(netif);
+        if (ipv6_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to create IPv6 link-local address: %s", esp_err_to_name(ipv6_err));
+        }
+    }
+
+    if (event_base == IP_EVENT && event_id == IP_EVENT_GOT_IP6) {
+        ip_event_got_ip6_t * event = (ip_event_got_ip6_t *) event_data;
+        
+        // Convert IPv6 address to string
+        char ipv6_str[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, &event->ip6_info.ip, ipv6_str, sizeof(ipv6_str));
+        
+        // Check if it's a link-local address (fe80::/10)
+        if ((event->ip6_info.ip.addr[0] & 0xFFC0) == 0xFE80) {
+            // For link-local addresses, append zone identifier using netif index
+            int netif_index = esp_netif_get_netif_impl_index(event->esp_netif);
+            if (netif_index >= 0) {
+                snprintf(GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str,
+                        sizeof(GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str),
+                        "%s%%%d", ipv6_str, netif_index);
+                ESP_LOGI(TAG, "IPv6 Link-Local Address: %s", GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str);
+            } else {
+                strncpy(GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str, ipv6_str,
+                       sizeof(GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str) - 1);
+                GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str[sizeof(GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str) - 1] = '\0';
+                ESP_LOGW(TAG, "IPv6 Link-Local Address: %s (could not get interface index)", ipv6_str);
+            }
+        } else {
+            // Global or ULA address - no zone identifier needed
+            strncpy(GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str, ipv6_str,
+                   sizeof(GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str) - 1);
+            GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str[sizeof(GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str) - 1] = '\0';
+            ESP_LOGI(TAG, "IPv6 Address: %s", GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str);
+        }
     }
 }
 
-esp_netif_t * wifi_init_softap(char * ap_ssid)
+esp_netif_t * wifi_init_softap(GlobalState * GLOBAL_STATE)
 {
     esp_netif_t * esp_netif_ap = esp_netif_create_default_wifi_ap();
 
     uint8_t mac[6];
     esp_wifi_get_mac(ESP_IF_WIFI_AP, mac);
     // Format the last 4 bytes of the MAC address as a hexadecimal string
-    snprintf(ap_ssid, 32, "Bitaxe_%02X%02X", mac[4], mac[5]);
+    snprintf(GLOBAL_STATE->SYSTEM_MODULE.ap_ssid, sizeof(GLOBAL_STATE->SYSTEM_MODULE.ap_ssid), "Bitaxe_%02X%02X", mac[4], mac[5]);
 
-    wifi_config_t wifi_ap_config;
-    memset(&wifi_ap_config, 0, sizeof(wifi_ap_config)); // Clear the structure
-    strncpy((char *) wifi_ap_config.ap.ssid, ap_ssid, sizeof(wifi_ap_config.ap.ssid));
-    wifi_ap_config.ap.ssid_len = strlen(ap_ssid);
+    wifi_config_t wifi_ap_config = { 0 };
+    wifi_ap_config.ap.ssid_len = strlen(GLOBAL_STATE->SYSTEM_MODULE.ap_ssid);
+    memcpy(wifi_ap_config.ap.ssid, GLOBAL_STATE->SYSTEM_MODULE.ap_ssid, wifi_ap_config.ap.ssid_len);
     wifi_ap_config.ap.channel = 1;
     wifi_ap_config.ap.max_connection = 10;
     wifi_ap_config.ap.authmode = WIFI_AUTH_OPEN;
@@ -241,26 +311,44 @@ esp_netif_t * wifi_init_softap(char * ap_ssid)
     return esp_netif_ap;
 }
 
+static bool is_wifi_operation_allowed(esp_err_t err)
+{
+    if (err == ESP_ERR_WIFI_NOT_INIT || err == ESP_ERR_WIFI_STOP_STATE) {
+        ESP_LOGI(TAG, "WiFi not initialized or stopped, skipping operation");
+        return false;
+    }
+    return true;
+}
+
 void toggle_wifi_softap(void)
 {
     wifi_mode_t mode = WIFI_MODE_NULL;
-    ESP_ERROR_CHECK(esp_wifi_get_mode(&mode));
-
-    if (mode == WIFI_MODE_APSTA) {
-        wifi_softap_off();
-    } else {
-        wifi_softap_on();
+    esp_err_t err = esp_wifi_get_mode(&mode);
+    if (is_wifi_operation_allowed(err)) {
+        ESP_ERROR_CHECK(err);
+    
+        if (mode == WIFI_MODE_APSTA) {
+            wifi_softap_off();
+        } else {
+            wifi_softap_on();
+        }
     }
 }
 
-void wifi_softap_off(void)
+static void wifi_softap_off(void)
 {
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (is_wifi_operation_allowed(err)) {
+        ESP_ERROR_CHECK(err);
+    }
 }
 
-void wifi_softap_on(void)
+static void wifi_softap_on(void)
 {
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (is_wifi_operation_allowed(err)) {
+        ESP_ERROR_CHECK(err);
+    }
 }
 
 /* Initialize wifi station */
@@ -299,8 +387,12 @@ esp_netif_t * wifi_init_sta(const char * wifi_ssid, const char * wifi_pass)
         },
     };
 
-    strncpy((char *) wifi_sta_config.sta.ssid, wifi_ssid, sizeof(wifi_sta_config.sta.ssid));
-    wifi_sta_config.sta.ssid[sizeof(wifi_sta_config.sta.ssid) - 1] = '\0';
+    size_t ssid_len = strlen(wifi_ssid);
+    if (ssid_len > 32) ssid_len = 32;
+    memcpy(wifi_sta_config.sta.ssid, wifi_ssid, ssid_len);
+    if (ssid_len < 32) {
+        wifi_sta_config.sta.ssid[ssid_len] = '\0';
+    }
 
     if (authmode != WIFI_AUTH_OPEN) {
         strncpy((char *) wifi_sta_config.sta.password, wifi_pass, sizeof(wifi_sta_config.sta.password));
@@ -311,12 +403,17 @@ esp_netif_t * wifi_init_sta(const char * wifi_ssid, const char * wifi_pass)
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config));
 
+    // IPv6 link-local address will be created after WiFi connection
+    
+    // Start DHCP client for IPv4
+    esp_netif_dhcpc_start(esp_netif_sta);
+
     ESP_LOGI(TAG, "wifi_init_sta finished.");
 
     return esp_netif_sta;
 }
 
-void wifi_init(void * pvParameters, const char * wifi_ssid, const char * wifi_pass, const char * hostname)
+void wifi_init(void * pvParameters)
 {
     GlobalState * GLOBAL_STATE = (GlobalState *) pvParameters;
 
@@ -325,8 +422,10 @@ void wifi_init(void * pvParameters, const char * wifi_ssid, const char * wifi_pa
 
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
+    esp_event_handler_instance_t instance_got_ip6;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, GLOBAL_STATE, &instance_any_id));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, GLOBAL_STATE, &instance_got_ip));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_GOT_IP6, &event_handler, GLOBAL_STATE, &instance_got_ip6));
 
     /* Initialize Wi-Fi */
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -335,10 +434,12 @@ void wifi_init(void * pvParameters, const char * wifi_ssid, const char * wifi_pa
     wifi_softap_on();
 
     /* Initialize AP */
-    wifi_init_softap(GLOBAL_STATE->SYSTEM_MODULE.ap_ssid);
+    wifi_init_softap(GLOBAL_STATE);
+
+    GLOBAL_STATE->SYSTEM_MODULE.ssid = nvs_config_get_string(NVS_CONFIG_WIFI_SSID);
 
     /* Skip connection if SSID is null */
-    if (strlen(wifi_ssid) == 0) {
+    if (strlen(GLOBAL_STATE->SYSTEM_MODULE.ssid) == 0) {
         ESP_LOGI(TAG, "No WiFi SSID provided, skipping connection");
 
         /* Start WiFi */
@@ -349,15 +450,22 @@ void wifi_init(void * pvParameters, const char * wifi_ssid, const char * wifi_pa
 
         return;
     } else {
+
+        char * wifi_pass = nvs_config_get_string(NVS_CONFIG_WIFI_PASS);
+
         /* Initialize STA */
         ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
-        esp_netif_t * esp_netif_sta = wifi_init_sta(wifi_ssid, wifi_pass);
+        esp_netif_t * esp_netif_sta = wifi_init_sta(GLOBAL_STATE->SYSTEM_MODULE.ssid, wifi_pass);
+
+        free(wifi_pass);
 
         /* Start Wi-Fi */
         ESP_ERROR_CHECK(esp_wifi_start());
 
         /* Disable power savings for best performance */
         ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+        char * hostname  = nvs_config_get_string(NVS_CONFIG_HOSTNAME);
 
         /* Set Hostname */
         esp_err_t err = esp_netif_set_hostname(esp_netif_sta, hostname);
@@ -366,6 +474,8 @@ void wifi_init(void * pvParameters, const char * wifi_ssid, const char * wifi_pa
         } else {
             ESP_LOGI(TAG, "ESP_WIFI setting hostname to: %s", hostname);
         }
+
+        free(hostname);
 
         ESP_LOGI(TAG, "wifi_init_sta finished.");
 
